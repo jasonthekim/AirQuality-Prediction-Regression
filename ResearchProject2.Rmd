@@ -1,0 +1,296 @@
+---
+title: "Building Prediction Models for PM2.5 Concentrations in the Continental U.S."
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+date: "Jason Kim, Sina Saberi, Sarah Nguyen"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Introduction:**
+The goal of this research is to evaluate the performance of many predictors of ambient air pollution concentrations in the continental United States. This will be accomplished with a dataset containing annual average concentrations of fine particulate matter (PM2.5). Four regression prediction models will be built to determine how well the predictors explain the data and any variation that might be observed, primarily focusing on the outcome 'value'. Then, the performance of each of the models will be compared to one another to deduce which is the best and most fitting model, using the RMSE.
+
+To first determine which predictor variables to use, the data was split into a training and testing dataset and the correlation values for the predictors were calculated. PCA was also used to find other relevant predictors. At the end of this analysis, we found that CMAQ, imp_a5000, and log_pri_length_15000 were the three predictor variables with the greatest correlations and will thus be used in the development of the models. CMAQ represents the concentration predictions from a numerical computer model developed by the EPA that simulates pollution in the atmosphere, imp_a5000 is the impervious surface measure within a circular radius of 5000 meters around the monitor, and log_pri_length_15000 is the count of primary road length in meters in a circular radius of 15000 meters around the monitor. 
+
+To investigate these predictor variables, the first predictor model we will build is the linear regression, with the second being the Poisson regression model. The third that we will build to analyze is the random Forest regression, and the fourth will be the multivariate adaptive regression splines (MARS) regression model.
+
+The data will be split into a training dataset (contains a random 70% of the datapoints) and a testing dataset (contains the remaining random 30% of the datapoints). The main prediction metric that will be used to compare each of the models is the root mean-squared error (RMSE).
+
+```{r}
+# Load tidyverse + tidymodels + randomForest + plotROC + earth packages and PM2.5 dataset
+library(tidyverse)
+library(tidymodels)
+library(randomForest)
+library(plotROC)
+library(earth)
+dat <- read_csv("https://github.com/rdpeng/stat322E_public/raw/main/data/pm25_data.csv.gz")
+```
+
+**Wrangling: Splitting Dataset into Training and Testing & Finding First Predictor**
+```{r}
+library(caret)
+
+# split the data into training and testing sets
+set.seed(123)
+trainIndex <- createDataPartition(dat$value, p = 0.7, list = FALSE, times = 1)
+training <- dat[trainIndex, ]
+testing <- dat[-trainIndex, ]
+
+# compute correlations between predictors and outcome
+correlations <- cor(training[, sapply(training, is.numeric)], training$value)
+
+# find max correlation
+max_correlation <- max(abs(correlations))
+
+# check the correlation between CMAQ and the outcome value in the training set is high
+cor(training$CMAQ, training$value)
+correlations
+```
+To wrangle with the dataset, we first split it into training and testing sub-datasets in order to properly evaluate the prediction metrics in an unbiased manner by using the createDataPartition() function from the caret library. We gave the training dataset random datapoints from 70% of the dataset, and the remaining 30% to the testing dataset. 
+
+Once we obtained our training dataset, we found the predictor with the highest correlation to the outcome value by using the cor() function, which was found to be *CMAQ*. 
+
+**Finding Other Relevant Predictor(s)**
+```{r}
+# select numeric columns for PCA
+data_for_pca <- training[, sapply(training, is.numeric)]
+
+# standardize data for PCA
+scaled_data <- scale(data_for_pca)
+
+# perform PCA
+pca_result <- prcomp(scaled_data)
+
+# extract values in PC1 column
+pc1 <- pca_result$rotation[, 1]
+
+pc1
+```
+In this section, we perform PCA to find other relevant predictors. From the PCA results, we decided to choose *imp_a5000* and *log_pri_length_15000*, which had the highest correlation values to PC1. 
+
+
+**First Predictor Model: Linear Regression**
+```{r}
+# Set up 10-fold cross-validation
+trainControl <- trainControl(method = "cv", number = 10)
+
+# Fit linear regression model using 10-fold cross-validation
+linearRegression_model <- train(value ~ CMAQ + imp_a5000 + log_pri_length_15000, 
+                                data = training, 
+                                method = "lm",
+                                trControl = trainControl)
+
+# Print summary of the model
+summary(linearRegression_model)
+
+# Predict outcome value using linear regression model with testing dataset
+predict(linearRegression_model, testing)
+
+# Calculate RMSE using the 10-fold cross-validation results
+linear_RMSE1 <- sqrt(linearRegression_model$results$RMSE)
+
+# Alternatively, you can calculate RMSE using the testing dataset
+linear_RMSE <- testing %>%
+  mutate(pred = predict(linearRegression_model, testing)) %>%
+  summarize(rmse = sqrt(mean(value - pred)^2))
+
+linear_RMSE
+
+# Create scatterplot of predicted vs. actual values
+testing %>%
+  mutate(pred = predict(linearRegression_model, testing)) %>%
+  ggplot(aes(x = value, y = pred)) +
+  geom_point() +
+  geom_abline(intercept = linearRegression_model$finalModel$coefficients[1], slope = linearRegression_model$finalModel$coefficients[2] + linearRegression_model$finalModel$coefficients[3] + linearRegression_model$finalModel$coefficients[4]) +
+  labs(x = "Actual PM2.5 concentration", y = "Predicted PM2.5 concentration",
+       title = "Linear Regression Model: Actual vs. Predicted PM2.5 concentration")
+
+```
+In this section, we created our first predictor model, using linear regression, to predict our outcome value using the testing dataset with our chosen predictors. We calculated a residual standard error of 2.247. a multiple r-squared value of 0.2273, and an adjusted r-squared value of 0.2235. Because the residual standard error is rather large and the r-squared values are close to 0, this would indicate that the model does not perform very well. However, once we predicted the outcome values for the PM2.5 concentrations using the testing dataset, we calculated the root mean-squared error and found a value of 0.00606. This value is less than 2 micrograms per meters cubed, suggesting that it is good for the model or that the linear regression is a good fit for the testing dataset.
+
+**Second Predictor Model: Poisson Regression**
+```{r}
+# Create a new column called rounded_value by rounding the value column
+training$rounded_value <- round(training$value)
+
+# Set up 10-fold cross-validation
+trainControl <- trainControl(method = "cv", number = 10)
+
+# Fit Poisson regression model using 10-fold cross-validation
+poisson_model_cv <- train(rounded_value ~ imp_a5000 + log_pri_length_15000 + CMAQ, 
+                          data = training, 
+                          method = "glm",
+                          family = poisson(),
+                          trControl = trainControl)
+
+# Print summary of the model
+summary(poisson_model_cv)
+
+# Predict outcome value using Poisson regression model with testing dataset
+poisson_pred <- predict.train(poisson_model_cv, newdata = testing)
+
+# Convert predicted values to integer
+poisson_pred <- as.integer(round(poisson_pred))
+
+# Calculate RMSE using the testing dataset
+poisson_RMSE <- testing %>% 
+  mutate(pred = poisson_pred) %>%
+  summarize(rmse = sqrt(mean((value - pred)^2)))
+
+poisson_RMSE
+
+# Create scatterplot of predicted vs. actual values
+poisson_df <- data.frame(actual = testing$value, pred = poisson_pred)
+ggplot(poisson_df, aes(x = actual, y = pred)) +
+  geom_point() +
+  stat_smooth(method = "glm", method.args = list(family = "poisson"), se = FALSE) +
+  labs(x = "Actual PM2.5 concentration", y = "Predicted PM2.5 concentration",
+       title = "Poisson Regression Model: Actual vs. Predicted PM2.5 concentration")
+```
+Here, we create a Poisson model to predict the outcome value (annual average PM2.5 concentration). Once we calculated the RMSE for the testing dataset, we found a value of 2.26, which is moderately high; thus, we observe that the model may be improved by taking into account more predictors.
+
+**Third Predictor Model: Random Forest**
+```{r}
+# Load necessary packages
+library(caret)
+library(randomForest)
+
+# Set up 10-fold cross-validation
+train_control <- trainControl(method = "cv", number = 10)
+
+# Fit random forest model using 10-fold cross-validation
+randomForest_model <- train(value ~ CMAQ + imp_a5000 + log_pri_length_15000, data = training,
+                            method = "rf", trControl = train_control)
+
+# Print summary of random forest model
+print(randomForest_model)
+
+# Predict outcome value using random forest model with testing dataset
+predict(randomForest_model, testing)
+
+# Calculate RMSE
+randomForest_RMSE <- sqrt(mean((predict(randomForest_model, testing) - testing$value)^2))
+
+randomForest_RMSE
+
+# Plot feature importance
+importance <- varImp(randomForest_model$finalModel)
+ggplot(importance, aes(x = row.names(importance), y = Overall)) + 
+  geom_bar(stat = "identity", fill = "steelblue") +
+  ggtitle("Feature Importance Plot") +
+  xlab("Feature") +
+  ylab("Importance")
+
+```
+In this section, we created a randomForest model to predict the outcome value (annual average PM2.5 concentration). Once we calculated the RMSE for the testing dataset, we found a value of 2.07925, which is mildly highly and could possibly be improved by having larger training datasets and taking into account more predictors.
+
+**Fourth Predictor Model: Multivariate Adaptive Regression Splines (MARS)**
+```{r}
+# Create a grid of tuning parameters to search over
+mars_grid <- expand.grid(degree = 1:2, nprune = 2:5)
+
+# Fit MARS model to predict annual average PM2.5 concentration using 10-fold cross-validation
+set.seed(123)
+mars_model_cv <- train(value ~ CMAQ + imp_a5000 + log_pri_length_15000, 
+                       data = training, 
+                       method = "earth", 
+                       trControl = trainControl(method = "cv", number = 10, verboseIter = TRUE), 
+                       tuneGrid = mars_grid)
+
+# Print summary of MARS model
+summary(mars_model_cv)
+
+# Predict outcome value using MARS model with testing dataset
+mars_pred <- predict(mars_model_cv, testing)
+
+# Calculate RMSE using the testing dataset
+mars_RMSE <- testing %>% 
+  mutate(pred = mars_pred) %>%
+  summarize(rmse = sqrt(mean((value - pred)^2)))
+
+mars_RMSE
+
+# Plot predicted values against actual values
+plot(testing$value, mars_pred, xlab = "Actual Values", ylab = "Predicted Values", main = "MARS Model")
+
+# Add a diagonal reference line
+abline(a = 0, b = 1, col = "red")
+```
+In this section, we create our fourth predictor model, using Multivariate Adaptive Regression Splines (MARS). The RMSE value comes out to be 2.152469, which is moderately high; thus, we observe that this model may be improved by taking into account more predictors, or using larger training datasets.
+
+**Results:**
+```{r}
+# create a data frame of RMSE values
+RMSE_data <- data.frame(Model = c("Linear Regression", "Poisson Regression", "MARS", "Random Forest"),
+                        RMSE = c(linear_RMSE$rmse, poisson_RMSE$rmse, mars_RMSE$rmse, randomForest_RMSE))
+
+# sort the data frame by RMSE values in ascending order
+RMSE_data_sorted <- RMSE_data %>% arrange(RMSE)
+
+# print the sorted data frame
+RMSE_data_sorted
+```
+
+The development of the four prediction models involved creating a training and testing dataset, fitting each model to the training dataset, and evaluating their performance using the testing dataset.
+
+In splitting the data into training and testing sets, we used the createDataPartition function, with a ratio of 70:30, which randomly splits the dataset into two sets based on the specified ratio. The seed was set to 123 to ensure reproducibility of the results.
+
+The first model developed was a linear regression model. To evaluate the performance of this model, we used 10-fold cross-validation. The *trainControl()* function helped to set up the cross-validation, with the method set to "cv" and the number of folds set to 10. Then we used the *train()* function to fit the model to the training dataset, setting the method = "lm". The predict function was used to predict the outcome value using the testing dataset. Using the root mean squared error (RMSE), which was calculated using the cross-validation results or the testing dataset, the performance of the model was evaluated. Finally, we created a scatterplot of predicted vs. actual values to visualize the predictor model.
+
+The second model developed was a Poisson regression model. Before fitting the model, a new column called "rounded_value" was created by rounding the value column. This was necessary because the Poisson regression model assumes that the response variable is a count variable. To evaluate the performance of this model, 10-fold cross-validation was used. The *trainControl()* function was then used to set up the cross-validation, with the method set to "cv" and the number of folds set to 10. We then fit the model to the training dataset using the *train()* function, with the method set to "glm" and the family set to "poisson". Furthermore, we used the *predict.train()* function to predict the outcome value using the testing dataset. Finally, the performance of the model was evaluated using RMSE, which was calculated using the testing dataset, and a scatterplot of predicted vs. actual values was also created to help visualize the model.
+
+The third model developed was a MARS (Multivariate Adaptive Regression Splines) model. A grid of tuning parameters was created using the *expand.grid()* function, with the degree set to 1 or 2 and the nprune set to 2, 3, 4, or 5. To evaluate the performance of this model, 10-fold cross-validation was used. The trainControl function was used to set up the cross-validation, with the method set to "cv" and the number of folds set to 10. The train function was then used to fit the model to the training dataset, with the method set to "earth" and the tuneGrid argument set to the created grid of tuning parameters. The predict function was used to predict the outcome value using the testing dataset. Finally, we evaluated the performance of our model using RMSE, which was calculated using the testing dataset, and created a scatterplot of predicted vs. actual values.
+
+The fourth model developed was a random forest model. To evaluate the performance of this model, 10-fold cross-validation was used. The trainControl function was used to set up the cross-validation, with the method set to "cv" and the number of folds set to 10. The train function was then used to fit the model to the training dataset, with the method set to "rf". The predict function was used to predict the outcome value using the testing dataset. The performance of the model was evaluated using RMSE, which was calculated using the cross-validation results. A scatterplot of predicted vs. actual values was also created.
+
+After developing our four models, we created a table displaying each of their respective RMSE values for comparison. As a result, we observed that our Linear Regression Model had the lowest RMSE value of 0.0061, thus proving to be the best fit model. 
+
+**Discussion & Policy Questions:**
+Policy Question 1:
+For a similar set of actual values, their predicted concentrations are also similar and clustered most prominently at x-values (actual concentrations) 10-15 micrograms per cubic meter and y-values (predicted concentrations) 10-12 micrograms per cubic meter. We suspect that the performance is good at these locations because if the model's predictions are closest to the observed values in areas with high levels of CMAQ and imp_a5000, it could suggest that those variables are relevant predictors of PM2.5 concentrations at those locations. On the contrary, if the model's predictions are farthest from the observed values in areas with low levels of log_pri_length_15000, it could suggest that this variable is not as relevant for predicting PM2.5 concentrations at those locations. It is also possible that other variables or factors that are not included in the model could be contributing to the good or bad performance at certain locations. For example, if there are sources of PM2.5 pollution in a particular area that are not captured by the variables in the model, this could lead to poorer performance of the model in predicting PM2.5 concentration in that location.
+
+Policy Question 2: 
+The weather for different regions could vary and we hypothesize that during rainfall and precipitation, air pollution can be removed from the atmostphere , while during drier weather, air pollution can accumulate.
+Another factor to consider is measurement error. The model may perform worse in areas where there is more measurement error or where monitoring data is sparse.
+When less data is accumulated in a specific region, the variation for the data could be greater. 
+Finally, weather and time of day, variables that are not included in the dataset, are possible confounding factors that may improve the model performance if they were included.
+
+Policy Question 3:
+```{r}
+# Add AOD predictor to the model
+linearRegression_model_AOD <- train(value ~ CMAQ + imp_a5000 + log_pri_length_15000 + aod, 
+                                data = training, 
+                                method = "lm",
+                                trControl = trainControl)
+
+# Remove AOD and CMAQ predictors from model
+linearRegression_model_without <- train(value ~ imp_a5000 + log_pri_length_15000, 
+                                data = training, 
+                                method = "lm",
+                                trControl = trainControl)
+
+# Calculate respectifve RMSE values for modified models
+linear_RMSE_AOD <- sqrt(linearRegression_model_AOD$results$RMSE)
+linear_RMSE_without <- sqrt(linearRegression_model_without$results$RMSE)
+
+# Compare the RMSE values between original, with, and without AOD/CMAQ
+linear_RMSE1
+linear_RMSE_AOD
+linear_RMSE_without
+
+```
+With AOD as an added variable, the output value decreases very slightly in comparison to the original. Without AOD and CMAQ as added variables, the output value increases slightly. Thus, we can assume that using aod and CMAQ as predictor variables helps to make the linear regression model a slightly better predictor model. 
+
+Policy Question 4:
+Alaska and Hawaii are more far removed from the industrialization and globalization that has taken place in the continental United States. As a result, they likely experience less pollution and less contaminants in their air. Additionally, Alaska and Hawaii have different geographic features than the contiguous United States, such as mountains, volcanoes, and ocean currents, that can affect air pollution patterns. Therefore, our model might not be able to capture the unique air pollution patterns in these states. Furthermore, Hawaii's economy is based less on industry and more on tourism, thus having its PM2.5 value being possibly lower than expected based on models developed in contiguous United States. As for Alaska, however, the state has a significant oil and gas industry that may also impact air quality.
+
+
+
+We each found the most challenging part of this project to be finding which regression models to use. Each model has its own unique presentation, and at times, it appeared that our data and the functions we used were not compatible with the model and we had to backtrack and see if another model might be a better choice. It was also rather difficult trying to determine what kind of visualizations to create and how to get the code to work to produce the visualizations. We especially struggled with creating an ROC plot at some point in the project. We learned from this process as a whole that several models have been developed in the data science field, and they each have their own individualized purposes when it comes to predicting data. Each model may work better or worse with certain datasets, depending on what kind of data they contain. Overall, this research assignment was very insightful. 
+
+**Group Acknowledgements:**
+Jason was responsible for creating outlines for much of the coding, while Sina and Sarah assisted with proof-reading the code, interpreting the results, visualizations, and any computed values such as the RMSE. We each spent time together on every model ensuring that the model-building and its accompanying RMSE computation was accurate. Sarah drafted a good portion of the introduction and Sina contributed largely to the discussions. We each answered the policy questions together and successfully divided the work evenly!
